@@ -5,15 +5,15 @@ export function useSensorData(maxPoints = 50) {
   const [currentTemp, setCurrentTemp] = useState(26.5);
   const [lastUpdated, setLastUpdated] = useState('--:--:--');
   const [history, setHistory] = useState([]);
-  const [isConnected, setIsConnected] = useState(true);
-  const [isSimulating, setIsSimulating] = useState(true);
-  const [connectionMode, setConnectionMode] = useState('simulation');
+  const [isConnected, setIsConnected] = useState(false);
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [connectionMode, setConnectionMode] = useState('backend_websocket');
   const [packetCount, setPacketCount] = useState(0);
   const [stats, setStats] = useState({ min: 26.5, max: 26.5, avg: 26.5, count: 0 });
 
   useEffect(() => {
-    // Start simulation by default on launch
-    sensorService.startSimulation(2000);
+    // Connect to Node.js WebSocket Backend on launch
+    sensorService.connectBackendWebSocket();
 
     // Subscribe to telemetry stream
     const unsubscribeData = sensorService.subscribe((data) => {

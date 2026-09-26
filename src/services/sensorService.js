@@ -1,16 +1,18 @@
 /**
  * CanSat Telemetry Service Layer
- * Fully supports live incoming streams from ESP32 via:
- * 1. Web Serial API (Direct USB Cable - 115200 Baud)
- * 2. WebSockets (Wi-Fi real-time stream)
- * 3. REST API (HTTP polling)
- * 4. Simulation Mode (Demo generator)
+ * Connects directly to the Node.js Express + WebSocket Backend Server (ws://localhost:3001).
+ * Supports:
+ * 1. Live Node.js Backend WebSocket Connection
+ * 2. Web Serial API (Direct USB Cable from ESP32)
+ * 3. Wi-Fi WebSockets (Direct ESP32 IP)
+ * 4. REST API Polling
+ * 5. Simulation Mode (Fallback Demo)
  */
 
 class SensorService {
   constructor() {
-    this.mode = 'simulation'; // 'simulation' | 'serial' | 'websocket' | 'rest'
-    this.isSimulating = true;
+    this.mode = 'backend_websocket'; // 'backend_websocket' | 'simulation' | 'serial' | 'websocket' | 'rest'
+    this.isSimulating = false;
     this.simulationInterval = null;
     this.restInterval = null;
     this.webSocket = null;
@@ -21,14 +23,13 @@ class SensorService {
     this.statusListeners = new Set();
     this.packetCount = 0;
     
-    // Base simulation temperature state
     this.simTemp = 26.5;
     this.lastDataTime = Date.now();
-    this.isConnected = true;
+    this.isConnected = false;
     
-    // Watchdog to detect dropped ESP32 connections
+    // Watchdog timer to check server connectivity
     this.watchdogTimer = setInterval(() => {
-      if (Date.now() - this.lastDataTime > 5000 && this.isConnected && !this.isSimulating) {
+      if (Date.now() - this.lastDataTime > 6000 && this.isConnected && !this.isSimulating) {
         this.setConnected(false);
       }
     }, 2000);
@@ -70,7 +71,7 @@ class SensorService {
     }
   }
 
-  // Robust Telemetry Parser for all standard ESP32 output formats
+  // Robust Telemetry Parser for all standard ESP32 & Backend output formats
   parseTelemetryPayload(data) {
     if (!data) return null;
 
@@ -90,7 +91,6 @@ class SensorService {
       const trimmed = data.trim();
       if (!trimmed) return null;
 
-      // Sub-case 2a: JSON string
       if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
         try {
           const jsonObj = JSON.parse(trimmed);
@@ -98,7 +98,6 @@ class SensorService {
         } catch {}
       }
 
-      // Sub-case 2b: CSV e.g. "27.5,21:42:15"
       if (trimmed.includes(',')) {
         const parts = trimmed.split(',');
         const tempNum = parseFloat(parts[0]);
@@ -107,7 +106,6 @@ class SensorService {
         }
       }
 
-      // Sub-case 2c: Prefix label e.g. "TEMP: 27.5" or "Temperature = 27.5"
       const match = trimmed.match(/[-+]?\d*\.?\d+/);
       if (match) {
         const num = parseFloat(match[0]);
@@ -117,7 +115,6 @@ class SensorService {
       }
     }
 
-    // Case 3: Direct number
     if (typeof data === 'number' && !isNaN(data)) {
       return { temperature: data };
     }
@@ -142,6 +139,58 @@ class SensorService {
     const mins = String(now.getMinutes()).padStart(2, '0');
     const secs = String(now.getSeconds()).padStart(2, '0');
     return `${hrs}:${mins}:${secs}`;
+  }
+
+  // --- NODE.JS BACKEND WEBSOCKET CONNECT ---
+  connectBackendWebSocket() {
+    this.stopAll();
+    this.mode = 'backend_websocket';
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    // If running on Vite dev server (port 5173), connect to Node server on port 3001
+    const host = window.location.port === '5173' ? 'localhost:3001' : window.location.host;
+    const wsUrl = `${protocol}//${host}`;
+
+    try {
+      this.webSocket = new WebSocket(wsUrl);
+
+      this.webSocket.onopen = () => {
+        this.setConnected(true);
+      };
+
+      this.webSocket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === 'INIT_HISTORY' && Array.isArray(message.data)) {
+            message.data.forEach((packet) => this.notifyData(packet));
+          } else {
+            this.notifyData(message);
+          }
+        } catch {
+          this.notifyData(event.data);
+        }
+      };
+
+      this.webSocket.onerror = () => {
+        // Fallback to local simulation if backend server drops
+        if (!this.isConnected) {
+          this.startSimulation();
+        }
+      };
+
+      this.webSocket.onclose = () => {
+        if (this.mode === 'backend_websocket') {
+          // Attempt reconnect after 3s
+          setTimeout(() => {
+            if (this.mode === 'backend_websocket') {
+              this.connectBackendWebSocket();
+            }
+          }, 3000);
+        }
+      };
+    } catch (err) {
+      this.startSimulation();
+    }
   }
 
   // --- SIMULATION MODE ---
@@ -182,9 +231,7 @@ class SensorService {
       this.startSimulation();
     } else {
       this.stopSimulation();
-      if (this.mode === 'simulation') {
-        this.setConnected(false);
-      }
+      this.connectBackendWebSocket();
     }
   }
 
@@ -213,7 +260,7 @@ class SensorService {
         buffer += value;
         
         const lines = buffer.split('\n');
-        buffer = lines.pop(); // save incomplete line chunk
+        buffer = lines.pop();
 
         for (let line of lines) {
           this.notifyData(line);
@@ -274,12 +321,26 @@ class SensorService {
     this.restInterval = setInterval(fetchTemp, intervalMs);
   }
 
-  // Manually push a test value into the stream
-  sendManualTelemetry(tempValue) {
+  // Manually push a test value into the stream & POST to backend server
+  async sendManualTelemetry(tempValue) {
+    const numericTemp = parseFloat(tempValue);
+    const timestamp = this.getFormattedTimestamp();
+
+    // 1. Notify frontend listeners
     this.notifyData({
-      temperature: parseFloat(tempValue),
-      timestamp: this.getFormattedTimestamp()
+      temperature: numericTemp,
+      timestamp: timestamp
     });
+
+    // 2. POST to Node.js backend server API
+    try {
+      const host = window.location.port === '5173' ? 'localhost:3001' : window.location.host;
+      await fetch(`http://${host}/api/telemetry`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ temperature: numericTemp, timestamp: timestamp })
+      });
+    } catch {}
   }
 
   stopAll() {
